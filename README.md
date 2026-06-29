@@ -31,3 +31,14 @@ from `quick` is semantic, so the offline fallback does not guess it. Force a mod
 `OLLAMA_HOST`. Keep models warm for instant switching: `OLLAMA_KEEP_ALIVE=30m ollama serve`.
 
 Tuned `Modelfile.*` params come from [ollama-bench](https://github.com/justi/ollama-bench).
+
+## Tests
+
+```bash
+python3 test_ask.py
+```
+
+Offline tests (routing logic, classifier failure handling, flag parsing) need nothing - the
+network is mocked. The live tests verify your own setup end to end - that the `-fast` models
+answer and that classification works across languages - and skip automatically until you have
+built the models with `./setup.sh`.
