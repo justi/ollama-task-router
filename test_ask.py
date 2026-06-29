@@ -47,7 +47,9 @@ def mock_ask(recorder=None, response=None, raises=None):
 
     def fake(model, prompt, think, num_predict, temperature=None, timeout=900, fmt=None):
         if recorder is not None:
-            recorder.append({"model": model, "think": think, "num_predict": num_predict, "fmt": fmt})
+            recorder.append({"model": model, "prompt": prompt, "think": think,
+                             "num_predict": num_predict, "temperature": temperature,
+                             "timeout": timeout, "fmt": fmt})
         if raises is not None:
             raise raises
         return response if response is not None else {"response": "ok", "done_reason": "stop"}
@@ -91,8 +93,10 @@ def enum_response(category):
 class TestFallback(unittest.TestCase):
     """route_no_classifier: the language-independent fallback when the classifier is gone."""
 
-    def test_returns_a_valid_route(self):
-        self.assertIn(ask.route_no_classifier("anything"), ask.ROUTES)
+    def test_returns_the_documented_coder_default(self):
+        # The contract is "always the coder", not merely "some valid route" - an always-quick
+        # fallback would also be a valid route but would break the documented behavior.
+        self.assertEqual(ask.route_no_classifier("anything"), "code")
 
     def test_language_independent(self):
         # No natural-language keyword list, so every language resolves the same safe way.
@@ -108,11 +112,15 @@ class TestClassifier(unittest.TestCase):
         with mock_ask(response=enum_response("reason")):
             self.assertEqual(ask.classify_with_gemma("x"), "reason")
 
-    def test_uses_constrained_format(self):
+    def test_classify_call_is_constrained_and_fast(self):
         calls = []
         with mock_ask(recorder=calls, response=enum_response("code")):
             ask.classify_with_gemma("x")
-        self.assertIsNotNone(calls[0]["fmt"], "classifier must request a constrained JSON schema")
+        first = calls[0]
+        self.assertEqual(first["fmt"], ask.CLASSIFY_SCHEMA, "must constrain output to the enum schema")
+        self.assertEqual(first["temperature"], 0, "routing must be temperature 0")
+        self.assertEqual(first["timeout"], ask.ROUTE_TIMEOUT, "routing must fail fast, not block")
+        self.assertEqual(first["num_predict"], 24)
 
     def test_garbage_is_rejected(self):
         with mock_ask(response={"response": "sure, this is code!"}):
@@ -143,49 +151,97 @@ class TestRouteMapping(unittest.TestCase):
         self.assertEqual((gen["model"], gen["think"]), ("gemma-fast", False))
 
     def test_competing_flags_use_argv_order(self):
-        self.assertEqual(route(["--code", "--reason", "x"])[0]["model"], "qwen-fast")
-        self.assertEqual(route(["--reason", "--code", "x"])[0]["model"], "gpt-oss-fast")
+        gen, _ = route(["--code", "--reason", "x"])
+        self.assertEqual((gen["model"], gen["think"]), ("qwen-fast", None))
+        gen, _ = route(["--reason", "--code", "x"])
+        self.assertEqual((gen["model"], gen["think"]), ("gpt-oss-fast", "high"))
+
+    def test_losing_flag_is_stripped_from_prompt(self):
+        # The non-winning task flag must not leak into the text sent to the model.
+        gen, _ = route(["--code", "--reason", "real prompt"])
+        self.assertEqual(gen["prompt"], "real prompt")
 
     def test_no_classify_skips_classifier(self):
-        # --no-classify -> exactly one call (generation), routed to the coder, classifier never run.
-        gen, calls = route(["--no-classify", "solve this puzzle step by step"])
+        # Spy on the classifier itself: --no-classify must never invoke it (counting network
+        # calls is not enough - a classifier that returned without calling ask would slip through).
+        original = ask.classify_with_gemma
+        invoked = []
+        ask.classify_with_gemma = lambda *a, **k: invoked.append(1) or "reason"
+        try:
+            gen, _ = route(["--no-classify", "solve this puzzle step by step"])
+        finally:
+            ask.classify_with_gemma = original
+        self.assertEqual(invoked, [], "--no-classify must not run the classifier")
         self.assertEqual(gen["model"], "qwen-fast")
-        self.assertEqual(len(calls), 1)
 
     def test_classifier_label_drives_route(self):
-        self.assertEqual(route(["x"], response=enum_response("reason"))[0]["model"], "gpt-oss-fast")
-        self.assertEqual(route(["x"], response=enum_response("quick"))[0]["model"], "gemma-fast")
+        # The classifier label must select the model, AND generation must actually happen after
+        # it. For the quick route both calls hit gemma-fast, so assert the ORDER: a constrained
+        # classify call, then an unconstrained generation call to the mapped model.
+        for label, model in [("reason", "gpt-oss-fast"), ("quick", "gemma-fast")]:
+            with self.subTest(label=label):
+                calls = []
+                with mock_ask(recorder=calls, response=enum_response(label)):
+                    run_main(["x"])
+                self.assertGreaterEqual(len(calls), 2, "generation call is missing")
+                self.assertIsNotNone(calls[0]["fmt"], "first call should be the constrained classify")
+                self.assertIsNone(calls[-1]["fmt"], "last call should be generation, not the classifier")
+                self.assertEqual(calls[-1]["model"], model)
 
-    def test_classifier_failure_falls_back_to_coder(self):
-        gen, _ = route(["x"], response={"response": "not json"})
-        self.assertEqual(gen["model"], "qwen-fast")
+    def test_classifier_failure_retries_then_falls_back(self):
+        # Malformed JSON -> two constrained attempts -> generation to the coder.
+        calls = []
+        with mock_ask(recorder=calls, response={"response": "not json"}):
+            run_main(["x"])
+        self.assertEqual(len(calls), 3, "expected two classify retries then one generation")
+        self.assertIsNotNone(calls[0]["fmt"])
+        self.assertIsNotNone(calls[1]["fmt"])
+        self.assertIsNone(calls[2]["fmt"])
+        self.assertEqual(calls[2]["model"], "qwen-fast")
 
 
 @unittest.skipUnless(LIVE, LIVE_REASON)
 class TestLive(unittest.TestCase):
     """Runs only when your models are built - this is the "does my config work" check."""
 
-    def test_classifier_works_in_every_language(self):
-        # The point of the redesign: classification is by meaning, so any language resolves
-        # to a valid label (not None).
-        for prompt in ["write an is_prime function", "udowodnij ze sqrt(2) jest niewymierne",
-                       "Beweise, dass die Wurzel aus 2 irrational ist",
-                       "Quelle est la capitale de l'Australie?",
-                       "Resuelve este acertijo logico paso a paso"]:
+    def test_classifier_round_trips_in_every_language(self):
+        # Every language must yield a valid enum label (the constrained round-trip works), and
+        # the set must NOT collapse to one label - that would mean the classifier is stuck (e.g.
+        # always "code") rather than actually reading meaning. We do NOT pin which label each
+        # prompt gets: the reason-vs-quick boundary is a soft model judgement, not router code.
+        prompts = ["write an is_prime function in Python",
+                   "udowodnij, ze sqrt(2) jest niewymierne",
+                   "Beweise, dass die Wurzel aus 2 irrational ist",
+                   "Quelle est la capitale de l'Australie?",
+                   "Resuelve este acertijo logico paso a paso"]
+        labels = []
+        for prompt in prompts:
             with self.subTest(prompt=prompt):
-                self.assertIn(ask.classify_with_gemma(prompt), ask.ROUTES)
+                label = ask.classify_with_gemma(prompt)
+                self.assertIn(label, ask.ROUTES, "classifier returned no valid label")
+                labels.append(label)
+        self.assertGreaterEqual(len(set(labels)), 2,
+                                f"classifier looks stuck - only produced {set(labels)}")
 
-    def test_classifier_is_accurate_on_clear_cases(self):
+    def test_classifier_separates_code_from_non_code(self):
+        # The one hard discrimination we can pin without flakiness: an explicit "write a function"
+        # is code; a plain factual question is never code (quick vs reason stays soft).
         self.assertEqual(ask.classify_with_gemma("write an is_prime function in Python"), "code")
-        self.assertEqual(ask.classify_with_gemma("What is the capital of Australia?"), "quick")
+        self.assertIn(ask.classify_with_gemma("What is the capital of Australia?"), {"quick", "reason"})
 
-    def test_quick_model_answers(self):
+    def test_quick_model_answers_correctly(self):
         resp = ask.ask("gemma-fast", "What is the capital of Australia?", False, 200)
-        self.assertTrue(resp.get("response", "").strip(), "gemma-fast returned an empty answer")
+        text = resp.get("response", "")
+        self.assertTrue(text.strip(), "gemma-fast returned an empty answer")
+        self.assertIn("canberra", text.lower(), "gemma-fast did not actually answer the question")
 
-    def test_code_model_answers(self):
+    def test_code_model_answers_without_truncating(self):
         resp = ask.ask("qwen-fast", "Write a one-line Python is_prime function.", None, 512)
-        self.assertTrue(resp.get("response", "").strip(), "qwen-fast returned an empty answer")
+        text = resp.get("response", "")
+        self.assertTrue(text.strip(), "qwen-fast returned an empty answer")
+        self.assertNotEqual(resp.get("done_reason"), "length",
+                            "answer was truncated at num_predict - the budget is too small")
+        self.assertIn("prime", text.lower(), "qwen-fast did not return an is_prime function")
 
 
 if __name__ == "__main__":

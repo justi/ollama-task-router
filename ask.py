@@ -104,10 +104,10 @@ def main():
     if "--no-classify" in args:
         no_llm = True
         args = [a for a in args if a != "--no-classify"]
-    # first explicit task flag in argv order wins (no silent precedence between competing flags)
-    forced = next((a[2:] for a in args if a in ("--code", "--reason", "--quick")), None)
-    if forced:
-        args = [a for a in args if a != "--" + forced]
+    # first explicit task flag in argv order wins; strip them all so none leak into the prompt
+    task_flags = ("--code", "--reason", "--quick")
+    forced = next((a[2:] for a in args if a in task_flags), None)
+    args = [a for a in args if a not in task_flags]
     if not args:
         print(__doc__)
         sys.exit(1)
