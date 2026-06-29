@@ -31,9 +31,9 @@ if not HOST.startswith("http"):
 # task -> (model, think, num_predict). gpt-oss always thinks (level only); qwen has no thinking;
 # gemma E4B thinks by default, so the quick route passes think=False to turn it off.
 ROUTES = {
-    "code":   ("qwen-fast",    None,   4000),  # coder, no thinking
-    "reason": ("gpt-oss-fast", "high", 6000),  # thinking model, deep reasoning
-    "quick":  ("gemma-fast",   False,  1500),  # tiny, thinking off = fast factual answer
+    "code":   ("qwen-fast",    None,   4000),
+    "reason": ("gpt-oss-fast", "high", 6000),
+    "quick":  ("gemma-fast",   False,  1500),
 }
 
 ROUTE_TIMEOUT = 12  # routing must fail fast - a dead/slow classifier must not block for minutes
@@ -45,14 +45,12 @@ CLASSIFY_SCHEMA = {  # constrains the classifier to a parseable enum, not free t
 
 
 def route_no_classifier(prompt: str) -> str:
-    """Fallback used only when the gemma classifier is unavailable (server down, or --no-classify).
+    """Fallback when the classifier is unavailable (server down, or --no-classify).
 
-    It takes no signal from the prompt's language. 'reason' vs 'quick' is a semantic judgement with
-    no language-independent surface cue (a one-line proof and a trivia question look alike), so that
-    split stays the classifier's job. With no classifier, route everything to the capable daily-
-    driver coder: qwen-fast handles code and degrades gracefully on the rest, and never under-routes
-    to the tiny model, whose small budget would truncate the answer. A hardcoded keyword list (the
-    previous fallback) cannot be language-independent - which is the whole point of the classifier."""
+    Telling 'reason' from 'quick' is semantic with no language-independent cue, so that stays the
+    classifier's job. Here we route everything to the capable coder: qwen-fast handles code and
+    degrades gracefully on the rest, and we avoid the tiny model, whose small budget would truncate
+    a misrouted answer."""
     return "code"
 
 
