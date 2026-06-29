@@ -16,6 +16,7 @@ import io
 import json
 import sys
 import unittest
+import urllib.error
 import urllib.request
 
 import ask
@@ -62,19 +63,20 @@ def mock_ask(recorder=None, response=None, raises=None):
 
 
 def run_main(argv):
-    """Invoke ask.main() with the given args, capturing stdout/stderr."""
+    """Invoke ask.main() with the given args; return (stdout, stderr, exit_code)."""
     saved = sys.argv
     sys.argv = ["ask.py"] + argv
     out, err = io.StringIO(), io.StringIO()
+    code = 0
     try:
         with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
             try:
                 ask.main()
-            except SystemExit:
-                pass
+            except SystemExit as e:
+                code = 0 if e.code is None else (e.code if isinstance(e.code, int) else 1)
     finally:
         sys.argv = saved
-    return out.getvalue(), err.getvalue()
+    return out.getvalue(), err.getvalue(), code
 
 
 def route(argv, response=None):
@@ -198,6 +200,48 @@ class TestRouteMapping(unittest.TestCase):
         self.assertIsNotNone(calls[1]["fmt"])
         self.assertIsNone(calls[2]["fmt"])
         self.assertEqual(calls[2]["model"], "qwen-fast")
+
+
+class TestErrorReporting(unittest.TestCase):
+    """A failed call must explain itself, not crash or hand back a silent empty result.
+    All offline - the network is mocked - so these are deterministic and fast."""
+
+    def test_thinking_overflow_is_reported_not_silent(self):
+        # gpt-oss can burn the whole budget on thinking and emit no answer (done_reason=length,
+        # empty response). The router must say so and signal failure, not print a blank line.
+        with mock_ask(response={"response": "", "done_reason": "length"}):
+            out, err, code = run_main(["--reason", "a hard logic puzzle"])
+        self.assertEqual(out.strip(), "")
+        self.assertIn("overflow", err.lower())
+        self.assertNotEqual(code, 0)
+
+    def test_truncated_but_nonempty_answer_is_kept_with_note(self):
+        with mock_ask(response={"response": "partial answer", "done_reason": "length"}):
+            out, err, code = run_main(["--code", "x"])
+        self.assertIn("partial answer", out)
+        self.assertIn("truncated", err.lower())
+        self.assertEqual(code, 0)
+
+    def test_missing_model_is_distinct_from_server_down(self):
+        err404 = urllib.error.HTTPError(ask.HOST, 404, "not found", {}, None)
+        with mock_ask(raises=err404):
+            out, err, code = run_main(["--code", "x"])
+        low = err.lower()
+        self.assertIn("model", low)
+        self.assertNotIn("can't reach", low)  # 404 != server down - must not mislabel
+        self.assertNotEqual(code, 0)
+
+    def test_server_unreachable_is_reported(self):
+        with mock_ask(raises=urllib.error.URLError("connection refused")):
+            out, err, code = run_main(["--code", "x"])
+        self.assertIn("reach", err.lower())
+        self.assertNotEqual(code, 0)
+
+    def test_malformed_body_is_handled_cleanly(self):
+        with mock_ask(raises=json.JSONDecodeError("expecting value", "doc", 0)):
+            out, err, code = run_main(["--code", "x"])
+        self.assertNotEqual(code, 0)
+        self.assertIn("bad response", err.lower())
 
 
 @unittest.skipUnless(LIVE, LIVE_REASON)

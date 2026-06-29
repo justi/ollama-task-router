@@ -21,6 +21,7 @@ Build the models first with ./setup.sh. Override the endpoint with OLLAMA_HOST.
 import json
 import os
 import sys
+import urllib.error
 import urllib.request
 
 HOST = os.environ.get("OLLAMA_HOST", "http://localhost:11434").rstrip("/")
@@ -123,11 +124,29 @@ def main():
           f"{' (thinking, this may take a moment)' if think else ''}\n", file=sys.stderr)
     try:
         resp = ask(model, prompt, think, num_predict)
-    except urllib.error.URLError as e:
-        print(f"[!] Can't reach Ollama ({HOST}): {e}\n    Is the server running and is model '{model}' built? (./setup.sh)", file=sys.stderr)
+    except urllib.error.HTTPError as e:  # server reachable, request rejected (e.g. model missing)
+        if e.code == 404:
+            print(f"[!] Model '{model}' is not built on Ollama ({HOST}). Run ./setup.sh.", file=sys.stderr)
+        else:
+            print(f"[!] Ollama returned HTTP {e.code} for model '{model}': {e}", file=sys.stderr)
         sys.exit(1)
-    print((resp.get("response") or "").strip())
-    if resp.get("done_reason") == "length":
+    except urllib.error.URLError as e:  # server unreachable (down / wrong host)
+        print(f"[!] Can't reach Ollama ({HOST}): {e.reason}. Is the server running? (then ./setup.sh)", file=sys.stderr)
+        sys.exit(1)
+    except (json.JSONDecodeError, OSError) as e:  # malformed body / read timeout
+        print(f"[!] Bad response from Ollama ({HOST}): {e}", file=sys.stderr)
+        sys.exit(1)
+    answer = (resp.get("response") or "").strip()
+    truncated = resp.get("done_reason") == "length"
+    if not answer and truncated:
+        # Thinking ate the whole budget before any answer was emitted (gpt-oss overflow). Don't
+        # hand back a silent empty result - say what happened and how to fix it.
+        print(f"[!] No answer: the model used its entire {num_predict}-token budget on thinking "
+              f"before replying (thinking overflow). Raise num_predict for this task, lower the "
+              f"--think level, or use a non-thinking model.", file=sys.stderr)
+        sys.exit(1)
+    print(answer)
+    if truncated:
         print(f"\n[router] note: answer truncated at num_predict={num_predict} - raise the budget if it looks cut off.", file=sys.stderr)
 
 
