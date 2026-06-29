@@ -2,7 +2,7 @@
 
 A zero-dependency prompt router for Ollama. A small model classifies each prompt and routes it to
 the best of three local specialists - a coder, a reasoner, and a quick all-rounder - instead of one
-overloaded model. Needs Ollama and ~31 GB of RAM.
+overloaded model. Needs Ollama and ~41 GB of RAM (all three models; gemma is the classifier).
 
 ## Models
 
@@ -23,10 +23,11 @@ overloaded model. Needs Ollama and ~31 GB of RAM.
 
 ## Routing
 
-`gemma-fast` classifies each prompt (`code` / `reason` / `quick`) at `temperature 0`, so routing is
-accurate and deterministic, then dispatches to the matching model. If gemma is down it falls back to
-a keyword heuristic. Force a model with `--code` / `--reason` / `--quick`, skip the classifier with
-`--keyword`, or point elsewhere with `OLLAMA_HOST`. Keep models warm for instant switching:
-`OLLAMA_KEEP_ALIVE=30m ollama serve`.
+`gemma-fast` classifies each prompt (`code` / `reason` / `quick`) into a JSON label at
+`temperature 0` - language-independent (it reads meaning, not keywords) and stable - then dispatches
+to the matching model. If gemma is unreachable it routes to the coder (`qwen-fast`); telling `reason`
+from `quick` is semantic, so the offline fallback does not guess it. Force a model with `--code` /
+`--reason` / `--quick`, skip the classifier with `--no-classify`, or point elsewhere with
+`OLLAMA_HOST`. Keep models warm for instant switching: `OLLAMA_KEEP_ALIVE=30m ollama serve`.
 
 Tuned `Modelfile.*` params come from [ollama-bench](https://github.com/justi/ollama-bench).
