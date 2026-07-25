@@ -6,8 +6,8 @@ cd "$(dirname "$0")"
 
 command -v ollama >/dev/null || { echo "Install Ollama first: https://ollama.com"; exit 1; }
 
-echo "== Pulling base models (~41 GB total) =="
-ollama pull qwen3-coder:30b    # ~18 GB - coder, daily driver
+echo "== Pulling base models (~43 GB total) =="
+ollama pull qwen3.6:35b-a3b    # ~20 GB - dual-mode base, daily driver (code think-off / reason think-on)
 ollama pull gpt-oss:20b        # ~13 GB - thinking model, for reasoning
 ollama pull gemma4:e4b         # ~10 GB - tiny all-rounder
 

@@ -2,7 +2,7 @@
 """Tiny task router for three local models on Ollama - zero dependencies, stdlib only.
 
 It sends your prompt to the model that fits the task, then tells you which one it picked:
-  - code-ish prompt   -> qwen-fast    (dedicated coder, no thinking, fast in a loop)
+  - code-ish prompt   -> qwen-fast    (qwen3.6 dual-mode; code route forces thinking OFF, fast in a loop)
   - reasoning prompt   -> gpt-oss-fast (thinking model, for algorithms / step-by-step logic)
   - short / simple     -> gemma-fast   (tiny 10 GB all-rounder, for quick questions)
 
@@ -28,10 +28,11 @@ HOST = os.environ.get("OLLAMA_HOST", "http://localhost:11434").rstrip("/")
 if not HOST.startswith("http"):
     HOST = "http://" + HOST
 
-# task -> (model, think, num_predict). gpt-oss always thinks (level only); qwen has no thinking;
-# gemma E4B thinks by default, so the quick route passes think=False to turn it off.
+# task -> (model, think, num_predict). gpt-oss always thinks (level only); qwen-fast is qwen3.6
+# (dual-mode) - the code route forces think=False because thinking hurts code; gemma E4B thinks by
+# default, so the quick route also passes think=False to turn it off.
 ROUTES = {
-    "code":   ("qwen-fast",    None,   4000),
+    "code":   ("qwen-fast",    False,  4000),
     "reason": ("gpt-oss-fast", "high", 6000),
     "quick":  ("gemma-fast",   False,  1500),
 }
