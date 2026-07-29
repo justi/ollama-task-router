@@ -2,3 +2,6 @@ __pycache__/
 *.pyc
 
 .claude/
+
+# narrative-flow audit artifacts (internal working files, regenerable)
+*.narrative-flow.*
