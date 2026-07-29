@@ -30,7 +30,9 @@ if not HOST.startswith("http"):
 
 # task -> (model, think, num_predict). gpt-oss always thinks (level only); qwen-fast is qwen3.6
 # (dual-mode) - the code route forces think=False because thinking hurts code; gemma E4B thinks by
-# default, so the quick route also passes think=False to turn it off.
+# default, so the quick route also passes think=False to turn it off. num_predict is the per-route
+# budget and OVERRIDES the Modelfile default (reason 6000 for deep reasoning, quick 1500 for short
+# answers, code 4000); the Modelfile value is only the standalone `ollama run` floor.
 ROUTES = {
     "code":   ("qwen-fast",    False,  4000),
     "reason": ("gpt-oss-fast", "high", 6000),

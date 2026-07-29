@@ -26,13 +26,16 @@ overloaded model. Needs Ollama and ~43 GB of RAM (all three models; gemma is the
 `gemma-fast` classifies each prompt (`code` / `reason` / `quick`) into a JSON label at
 `temperature 0` - language-independent (it reads meaning, not keywords) and stable - then dispatches
 to the matching model - the code route runs `qwen-fast` (qwen3.6, dual-mode) with thinking forced OFF
-(thinking hurts code), while `gpt-oss-fast` always thinks. If gemma is unreachable it routes to the
+(thinking hurts code), `gpt-oss-fast` always thinks, and Gemma runs with thinking OFF too - both as
+the classifier and on the quick route. If gemma is unreachable it routes to the
 coder (`qwen-fast`); telling `reason`
 from `quick` is semantic, so the offline fallback does not guess it. Force a model with `--code` /
 `--reason` / `--quick`, skip the classifier with `--no-classify`, or point elsewhere with
 `OLLAMA_HOST`. Keep models warm for instant switching: `OLLAMA_KEEP_ALIVE=30m ollama serve`.
 
-Tuned `Modelfile.*` params come from [ollama-bench](https://github.com/justi/ollama-bench).
+Tuned `Modelfile.*` params come from [ollama-bench](https://github.com/justi/ollama-bench). The
+router also sets `num_predict` per route (code 4000 / reason 6000 / quick 1500), which overrides the
+Modelfile default so each task gets the budget it needs; the Modelfile value is the `ollama run` floor.
 
 ## Tests
 

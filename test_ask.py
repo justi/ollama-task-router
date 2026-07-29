@@ -190,6 +190,15 @@ class TestRouteMapping(unittest.TestCase):
                 self.assertIsNone(calls[-1]["fmt"], "last call should be generation, not the classifier")
                 self.assertEqual(calls[-1]["model"], model)
 
+    def test_classifier_code_forces_think_off(self):
+        # Decision B: a classifier-selected 'code' route must reach qwen-fast with thinking OFF,
+        # not just the explicit --code flag. Guards the invariant against a ROUTES regression.
+        calls = []
+        with mock_ask(recorder=calls, response=enum_response("code")):
+            run_main(["x"])
+        self.assertEqual(calls[-1]["model"], "qwen-fast")
+        self.assertIs(calls[-1]["think"], False, "code route must force thinking off")
+
     def test_classifier_failure_retries_then_falls_back(self):
         # Malformed JSON -> two constrained attempts -> generation to the coder.
         calls = []
@@ -280,7 +289,7 @@ class TestLive(unittest.TestCase):
         self.assertIn("canberra", text.lower(), "gemma-fast did not actually answer the question")
 
     def test_code_model_answers_without_truncating(self):
-        resp = ask.ask("qwen-fast", "Write a one-line Python is_prime function.", None, 512)
+        resp = ask.ask("qwen-fast", "Write a one-line Python is_prime function.", False, 512)
         text = resp.get("response", "")
         self.assertTrue(text.strip(), "qwen-fast returned an empty answer")
         self.assertNotEqual(resp.get("done_reason"), "length",
