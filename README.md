@@ -2,7 +2,9 @@
 
 A zero-dependency prompt router for Ollama. A small model classifies each prompt and routes it to
 the best of three local specialists - a coder, a reasoner, and a quick all-rounder - instead of one
-overloaded model. Needs Ollama and ~43 GB of RAM (all three models; gemma is the classifier).
+overloaded model. Needs Ollama; the three models are ~43 GB on disk, and at runtime each prompt loads
+the gemma classifier plus one specialist (the code route peaks around ~30 GB of RAM) - not all three at
+once unless you keep them warm.
 
 ## Models
 
