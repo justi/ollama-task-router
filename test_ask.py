@@ -142,7 +142,7 @@ class TestRouteMapping(unittest.TestCase):
 
     def test_force_code(self):
         gen, _ = route(["--code", "x"])
-        self.assertEqual((gen["model"], gen["think"]), ("qwen-fast", None))
+        self.assertEqual((gen["model"], gen["think"]), ("qwen-fast", False))
 
     def test_force_reason(self):
         gen, _ = route(["--reason", "x"])
@@ -154,7 +154,7 @@ class TestRouteMapping(unittest.TestCase):
 
     def test_competing_flags_use_argv_order(self):
         gen, _ = route(["--code", "--reason", "x"])
-        self.assertEqual((gen["model"], gen["think"]), ("qwen-fast", None))
+        self.assertEqual((gen["model"], gen["think"]), ("qwen-fast", False))
         gen, _ = route(["--reason", "--code", "x"])
         self.assertEqual((gen["model"], gen["think"]), ("gpt-oss-fast", "high"))
 
