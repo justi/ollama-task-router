@@ -17,12 +17,17 @@ once unless you keep them warm.
 ## Quick start
 
 ```bash
-./setup.sh                                            # pull bases + build the -fast variants (once)
+./setup.sh                                            # pull bases + build the -fast variants
 ./ask.py "write an is_prime function in Python"       # auto  -> qwen-fast
 ./ask.py --reason "prove that sqrt(2) is irrational"  # force reasoning -> qwen-fast (think on)
 ./ask.py --reason-hard "hardest logic puzzle ..."     # escalate         -> gpt-oss-fast
 ./ask.py --quick  "capital of Australia?"             # force            -> gemma-fast
 ```
+
+The `-fast` variants are built once as snapshots of their base weights, not live links - so an
+`ollama pull` that updates a base leaves them frozen on the old one (they keep running, so the drift
+is silent). Re-run `./setup.sh` after updating a base; `./setup.sh --check` reports drift (mismatched
+weight digests) without rebuilding.
 
 ## Routing
 
