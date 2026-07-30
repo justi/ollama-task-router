@@ -42,6 +42,34 @@ Tuned `Modelfile.*` params come from [ollama-bench](https://github.com/justi/oll
 router also sets `num_predict` per route (code 4000 / reason 8000 / reason-hard 10000 / quick 1500), which overrides the
 Modelfile default so each task gets the budget it needs; the Modelfile value is the `ollama run` floor.
 
+## Real work: sessions, context, streaming
+
+A bare one-shot router is a toy - real work is multi-turn and needs the code in front of it. Three
+small additions, all stdlib:
+
+```bash
+cat bug.py | ./ask.py --code "why does this crash on empty input?"   # pipe a file in as context
+./ask.py --file bug.py --code "fix it"                               # or name it with --file
+./ask.py --session fix "write is_prime"                              # start a remembered conversation
+./ask.py --session fix "now handle n < 2"                            # this turn sees the prior history
+./ask.py --continue "and add a docstring"                            # --continue == --session default
+./ask.py --stream --reason "..."                                     # print tokens as they arrive
+./ask.py --num-predict 16000 --reason "..."                          # one-shot budget override
+```
+
+A **session** (`--session <name>` / `--continue`) switches from stateless `/api/generate` to
+`/api/chat` with the conversation kept in `~/.ask-sessions/<name>.json`. It routes **each turn
+independently** - a coding turn goes to `qwen-fast`, a `--reason-hard` turn to `gpt-oss-fast` - but
+every model sees the shared history. Old turns are dropped past a recent window so the history keeps
+fitting `num_ctx`. **Context** comes from piped stdin or `--file <path>`, prepended to the prompt.
+**`--stream`** prints tokens live (default stays one-block so the output is still pipeable).
+**`--num-predict N`** overrides the route budget for one call (the retry hint on a thinking-overflow
+uses it).
+
+Whether routing *each turn* to a different specialist actually beats a single dual-mode qwen
+conversation is an open, measurable question - not assumed. See [docs/reason-routing.md](docs/reason-routing.md)
+for the measurement discipline this repo holds itself to.
+
 ## Tests
 
 ```bash

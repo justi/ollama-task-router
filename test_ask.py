@@ -14,7 +14,10 @@ Two layers:
 import contextlib
 import io
 import json
+import os
+import shutil
 import sys
+import tempfile
 import unittest
 import urllib.error
 import urllib.request
@@ -41,12 +44,12 @@ LIVE_REASON = "live: Ollama must be up with the -fast models built (run ./setup.
 
 @contextlib.contextmanager
 def mock_ask(recorder=None, response=None, raises=None):
-    """Replace ask.ask so routing can be tested without a server. Records every call and
-    returns `response` (default: a non-empty answer). The same payload is returned to the
-    classifier and to generation, so `response` also drives what the classifier parses."""
-    original = ask.ask
+    """Replace BOTH ask.ask (classifier / constrained calls) and ask.run (generation) so routing can
+    be tested without a server. Records every call; `response` (a /api/generate-style dict) drives
+    what the classifier parses AND what generation returns. calls[-1] is the generation call."""
+    original_ask, original_run = ask.ask, ask.run
 
-    def fake(model, prompt, think, num_predict, temperature=None, timeout=900, fmt=None):
+    def fake_ask(model, prompt, think, num_predict, temperature=None, timeout=900, fmt=None):
         if recorder is not None:
             recorder.append({"model": model, "prompt": prompt, "think": think,
                              "num_predict": num_predict, "temperature": temperature,
@@ -55,11 +58,26 @@ def mock_ask(recorder=None, response=None, raises=None):
             raise raises
         return response if response is not None else {"response": "ok", "done_reason": "stop"}
 
-    ask.ask = fake
+    def fake_run(endpoint, payload, stream=False, timeout=900, on_chunk=None):
+        if recorder is not None:
+            msgs = payload.get("messages")
+            recorder.append({"model": payload.get("model"), "think": payload.get("think"),
+                             "num_predict": (payload.get("options") or {}).get("num_predict"),
+                             "prompt": payload.get("prompt"),
+                             # snapshot: main() appends the assistant turn to this list AFTER run()
+                             "messages": list(msgs) if msgs is not None else None,
+                             "endpoint": endpoint, "stream": stream, "fmt": None})
+        if raises is not None:
+            raise raises
+        r = response if response is not None else {"response": "ok", "done_reason": "stop"}
+        answer = r.get("response") or (r.get("message") or {}).get("content") or ""
+        return answer, r.get("done_reason")
+
+    ask.ask, ask.run = fake_ask, fake_run
     try:
         yield
     finally:
-        ask.ask = original
+        ask.ask, ask.run = original_ask, original_run
 
 
 def run_main(argv):
@@ -258,6 +276,75 @@ class TestErrorReporting(unittest.TestCase):
             out, err, code = run_main(["--code", "x"])
         self.assertNotEqual(code, 0)
         self.assertIn("bad response", err.lower())
+
+
+class TestContextSessionBudget(unittest.TestCase):
+    """The multi-turn/context features: --file context, --num-predict, and --session shared history."""
+
+    def test_file_context_is_prepended_to_the_prompt(self):
+        with tempfile.NamedTemporaryFile("w", suffix=".py", delete=False) as f:
+            f.write("def buggy():\n    return 1 / 0\n")
+            path = f.name
+        try:
+            gen, _ = route(["--code", "--file", path, "why does this crash?"])
+        finally:
+            os.unlink(path)
+        self.assertEqual(gen["endpoint"], "generate")
+        self.assertIn("def buggy", gen["prompt"], "file content must reach the model")
+        self.assertIn("why does this crash?", gen["prompt"], "the task must too")
+
+    def test_num_predict_overrides_the_route_budget(self):
+        gen, _ = route(["--code", "--num-predict", "9000", "x"])
+        self.assertEqual(gen["num_predict"], 9000, "explicit budget must win over the ROUTES default")
+
+    def test_num_predict_rejects_non_positive_int(self):
+        _, err, code = run_main(["--code", "--num-predict", "-5", "x"])
+        self.assertNotEqual(code, 0)
+        self.assertIn("num-predict", err.lower())
+
+    def _in_temp_sessions(self):
+        d = tempfile.mkdtemp()
+        self._saved_session_dir = ask.SESSION_DIR
+        ask.SESSION_DIR = d
+        self.addCleanup(lambda: setattr(ask, "SESSION_DIR", self._saved_session_dir))
+        self.addCleanup(lambda: shutil.rmtree(d, ignore_errors=True))
+        return d
+
+    def test_session_uses_chat_and_persists_the_turn(self):
+        d = self._in_temp_sessions()
+        gen, _ = route(["--session", "t", "--code", "write is_prime"])
+        self.assertEqual(gen["endpoint"], "chat", "a session must use /api/chat, not /api/generate")
+        self.assertEqual(gen["model"], "qwen-fast")
+        self.assertEqual(gen["messages"][-1], {"role": "user", "content": "write is_prime"})
+        stored = json.load(open(os.path.join(d, "t.json"), encoding="utf-8"))["messages"]
+        self.assertEqual(stored[0]["role"], "user")
+        self.assertEqual(stored[-1]["role"], "assistant", "the answer must be persisted")
+
+    def test_session_second_turn_sees_prior_history(self):
+        self._in_temp_sessions()
+        route(["--session", "t", "--code", "write is_prime"])
+        gen2, _ = route(["--session", "t", "--code", "now add a docstring"])
+        self.assertGreaterEqual(len(gen2["messages"]), 3, "turn 2 must include prior user+assistant")
+        self.assertEqual(gen2["messages"][-1]["content"], "now add a docstring")
+
+    def test_session_per_turn_routing_over_shared_history(self):
+        # The whole point of a multi-specialist session: turn 1 is code (-> qwen think off), turn 2 is
+        # forced reasoning (-> qwen think ON) - a DIFFERENT think setting, same shared history.
+        self._in_temp_sessions()
+        g1, _ = route(["--session", "t", "--code", "write a sort"])
+        g2, _ = route(["--session", "t", "--reason-hard", "prove it terminates"])
+        self.assertEqual((g1["model"], g1["think"]), ("qwen-fast", False))
+        self.assertEqual((g2["model"], g2["think"]), ("gpt-oss-fast", "high"))
+        self.assertIn("write a sort", [m["content"] for m in g2["messages"]])  # shared history
+
+    def test_session_trims_to_the_recent_window(self):
+        self._in_temp_sessions()
+        long_history = [{"role": "user" if i % 2 == 0 else "assistant", "content": str(i)}
+                        for i in range(ask.MAX_MESSAGES + 6)]
+        ask.save_session("t", long_history)
+        gen, _ = route(["--session", "t", "--code", "next"])
+        self.assertLessEqual(len(gen["messages"]), ask.MAX_MESSAGES, "old turns dropped to fit num_ctx")
+        self.assertEqual(gen["messages"][-1]["content"], "next")
 
 
 @unittest.skipUnless(LIVE, LIVE_REASON)
