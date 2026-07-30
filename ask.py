@@ -2,16 +2,19 @@
 """Tiny task router for three local models on Ollama - zero dependencies, stdlib only.
 
 It sends your prompt to the model that fits the task, then tells you which one it picked:
-  - code-ish prompt   -> qwen-fast    (qwen3.6 dual-mode; code route forces thinking OFF, fast in a loop)
-  - reasoning prompt   -> gpt-oss-fast (thinking model, for algorithms / step-by-step logic)
+  - code-ish prompt   -> qwen-fast    (qwen3.6 dual-mode; thinking OFF - thinking hurts code)
+  - reasoning prompt   -> qwen-fast    (same qwen3.6 with thinking ON - reasons as well as gpt-oss
+                                        and is more reliable; see docs/reason-routing.md)
   - short / simple     -> gemma-fast   (tiny 10 GB all-rounder, for quick questions)
+  - hardest reasoning  -> gpt-oss-fast (dedicated thinking model; opt in with --reason-hard)
 
 Routing: the tiny model (gemma) classifies the task (code/reason/quick) into a constrained JSON
 label at temperature 0 - language-independent (it reads meaning, not keywords) and stable. If gemma
 is unreachable it falls back to the daily-driver coder (see route_no_classifier). Override anytime:
 
   ./ask.py "write an is_prime function in Python"           # auto (gemma classifies) -> qwen-fast
-  ./ask.py --reason "prove that sqrt(2) is irrational"      # force reasoning
+  ./ask.py --reason "prove that sqrt(2) is irrational"      # force reasoning -> qwen-fast (think on)
+  ./ask.py --reason-hard "..."                              # escalate hardest reasoning -> gpt-oss
   ./ask.py --quick  "capital of Australia?"                 # force the tiny model
   ./ask.py --code   "refactor this loop ..."                # force the coder
   ./ask.py --no-classify "..."                              # skip gemma -> route to the coder
@@ -28,15 +31,17 @@ HOST = os.environ.get("OLLAMA_HOST", "http://localhost:11434").rstrip("/")
 if not HOST.startswith("http"):
     HOST = "http://" + HOST
 
-# task -> (model, think, num_predict). gpt-oss always thinks (level only); qwen-fast is qwen3.6
-# (dual-mode) - the code route forces think=False because thinking hurts code; gemma E4B thinks by
-# default, so the quick route also passes think=False to turn it off. num_predict is the per-route
-# budget and OVERRIDES the Modelfile default (reason 6000 for deep reasoning, quick 1500 for short
-# answers, code 4000); the Modelfile value is only the standalone `ollama run` floor.
+# task -> (model, think, num_predict). qwen-fast is qwen3.6 (dual-mode): code forces think=False
+# (thinking hurts code), reason turns think ON - qwen3.6-think-on reasons as well as gpt-oss AND is
+# more reliable (measured n=30, see docs/reason-routing.md). gemma E4B thinks by default, so quick
+# passes think=False. gpt-oss (always thinks; level only) is the explicit hard-reasoning escalation
+# (--reason-hard), NOT the default reason route. num_predict is the per-route budget and OVERRIDES
+# the Modelfile default; the Modelfile value is only the standalone `ollama run` floor.
 ROUTES = {
-    "code":   ("qwen-fast",    False,  4000),
-    "reason": ("gpt-oss-fast", "high", 6000),
-    "quick":  ("gemma-fast",   False,  1500),
+    "code":        ("qwen-fast",    False,  4000),
+    "reason":      ("qwen-fast",    True,   8000),   # dual-mode qwen, thinking ON
+    "reason-hard": ("gpt-oss-fast", "high", 10000),  # explicit escalation (--reason-hard)
+    "quick":       ("gemma-fast",   False,  1500),
 }
 
 ROUTE_TIMEOUT = 12  # routing must fail fast - a dead/slow classifier must not block for minutes
@@ -107,7 +112,7 @@ def main():
         no_llm = True
         args = [a for a in args if a != "--no-classify"]
     # first explicit task flag in argv order wins; strip them all so none leak into the prompt
-    task_flags = ("--code", "--reason", "--quick")
+    task_flags = ("--code", "--reason", "--reason-hard", "--quick")
     forced = next((a[2:] for a in args if a in task_flags), None)
     args = [a for a in args if a not in task_flags]
     if not args:

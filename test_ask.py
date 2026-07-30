@@ -146,6 +146,12 @@ class TestRouteMapping(unittest.TestCase):
 
     def test_force_reason(self):
         gen, _ = route(["--reason", "x"])
+        self.assertEqual((gen["model"], gen["think"]), ("qwen-fast", True))
+
+    def test_force_reason_hard_escalates_to_gpt_oss(self):
+        # --reason-hard is the explicit escalation: the ONLY route to gpt-oss now that the default
+        # reason route goes to qwen-fast (think on). Guards the escalation invariant.
+        gen, _ = route(["--reason-hard", "x"])
         self.assertEqual((gen["model"], gen["think"]), ("gpt-oss-fast", "high"))
 
     def test_force_quick(self):
@@ -156,7 +162,7 @@ class TestRouteMapping(unittest.TestCase):
         gen, _ = route(["--code", "--reason", "x"])
         self.assertEqual((gen["model"], gen["think"]), ("qwen-fast", False))
         gen, _ = route(["--reason", "--code", "x"])
-        self.assertEqual((gen["model"], gen["think"]), ("gpt-oss-fast", "high"))
+        self.assertEqual((gen["model"], gen["think"]), ("qwen-fast", True))
 
     def test_losing_flag_is_stripped_from_prompt(self):
         # The non-winning task flag must not leak into the text sent to the model.
@@ -180,7 +186,7 @@ class TestRouteMapping(unittest.TestCase):
         # The classifier label must select the model, AND generation must actually happen after
         # it. For the quick route both calls hit gemma-fast, so assert the ORDER: a constrained
         # classify call, then an unconstrained generation call to the mapped model.
-        for label, model in [("reason", "gpt-oss-fast"), ("quick", "gemma-fast")]:
+        for label, model in [("reason", "qwen-fast"), ("quick", "gemma-fast")]:
             with self.subTest(label=label):
                 calls = []
                 with mock_ask(recorder=calls, response=enum_response(label)):
@@ -216,8 +222,9 @@ class TestErrorReporting(unittest.TestCase):
     All offline - the network is mocked - so these are deterministic and fast."""
 
     def test_thinking_overflow_is_reported_not_silent(self):
-        # gpt-oss can burn the whole budget on thinking and emit no answer (done_reason=length,
-        # empty response). The router must say so and signal failure, not print a blank line.
+        # A thinking route (--reason -> qwen-fast think-on, or gpt-oss via --reason-hard) can burn the
+        # whole budget on thinking and emit no answer (done_reason=length, empty response). The router
+        # must say so and signal failure, not print a blank line.
         with mock_ask(response={"response": "", "done_reason": "length"}):
             out, err, code = run_main(["--reason", "a hard logic puzzle"])
         self.assertEqual(out.strip(), "")
