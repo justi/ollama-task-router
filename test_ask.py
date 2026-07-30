@@ -327,15 +327,43 @@ class TestContextSessionBudget(unittest.TestCase):
         self.assertGreaterEqual(len(gen2["messages"]), 3, "turn 2 must include prior user+assistant")
         self.assertEqual(gen2["messages"][-1]["content"], "now add a docstring")
 
-    def test_session_per_turn_routing_over_shared_history(self):
-        # The whole point of a multi-specialist session: turn 1 is code (-> qwen think off), turn 2 is
-        # forced reasoning (-> qwen think ON) - a DIFFERENT think setting, same shared history.
+    def test_explicit_flag_overrides_sticky_per_turn(self):
+        # Sessions are sticky by default, but an explicit flag is the per-turn escape hatch: turn 1
+        # code (-> qwen), turn 2 forced --reason-hard (-> gpt-oss), over the same shared history.
         self._in_temp_sessions()
         g1, _ = route(["--session", "t", "--code", "write a sort"])
         g2, _ = route(["--session", "t", "--reason-hard", "prove it terminates"])
         self.assertEqual((g1["model"], g1["think"]), ("qwen-fast", False))
         self.assertEqual((g2["model"], g2["think"]), ("gpt-oss-fast", "high"))
         self.assertIn("write a sort", [m["content"] for m in g2["messages"]])  # shared history
+
+    def test_session_is_sticky_after_first_turn(self):
+        # Sticky routing: the session locks onto its first turn's model and stays there. A trivia
+        # follow-up that the classifier WOULD send to gemma keeps running on qwen - no model bounce,
+        # warm cache. And the classifier must not even run on the sticky turn.
+        self._in_temp_sessions()
+        g1, _ = route(["--session", "t", "write is_prime"], response=enum_response("code"))
+        self.assertEqual(g1["model"], "qwen-fast")
+        g2, calls2 = route(["--session", "t", "what is its time complexity?"],
+                           response=enum_response("quick"))
+        self.assertEqual(g2["model"], "qwen-fast", "sticky: turn 2 stays on the session's model")
+        self.assertEqual(len(calls2), 1, "sticky turn must skip classification (generation call only)")
+
+    def test_session_locks_route_on_first_turn(self):
+        d = self._in_temp_sessions()
+        route(["--session", "t", "solve this step by step"], response=enum_response("reason"))
+        stored = json.load(open(os.path.join(d, "t.json"), encoding="utf-8"))
+        self.assertEqual(stored.get("route"), "reason", "first turn must lock the session's route")
+
+    def test_oneoff_flag_does_not_move_the_sticky_lock(self):
+        # An explicit flag routes THAT turn but must not re-lock the session: after a one-off
+        # --reason-hard, a later no-flag turn returns to the originally locked model, not gpt-oss.
+        self._in_temp_sessions()
+        route(["--session", "t", "write code"], response=enum_response("code"))      # lock = code
+        g2, _ = route(["--session", "t", "--reason-hard", "one hard question"])       # one-off gpt-oss
+        self.assertEqual(g2["model"], "gpt-oss-fast")
+        g3, _ = route(["--session", "t", "keep going"], response=enum_response("quick"))
+        self.assertEqual(g3["model"], "qwen-fast", "one-off flag must not move the sticky lock")
 
     def test_session_trims_to_the_recent_window(self):
         self._in_temp_sessions()

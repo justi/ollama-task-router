@@ -28,8 +28,10 @@ Real work is multi-turn and needs context, so also:
   ./ask.py --continue "and add a docstring"                          # --continue = --session default
   ./ask.py --stream --reason "..."                                    # print tokens as they arrive
 
-A session routes EACH turn independently (a coding turn -> qwen, a reasoning turn -> the reasoner),
-but every model sees the shared history. Sessions live in ~/.ask-sessions/<name>.json.
+A session classifies its FIRST turn, then STAYS on that model for the rest (sticky routing): a
+coding turn and a follow-up trivia turn both run on qwen, so one model's KV cache stays warm and
+nothing reloads mid-conversation. An explicit flag (--code/--reason/--quick) overrides a single
+turn; --reason-hard escalates that one turn to gpt-oss. Sessions live in ~/.ask-sessions/<name>.json.
 
 Build the models first with ./setup.sh. Override the endpoint with OLLAMA_HOST.
 """
@@ -175,13 +177,29 @@ def load_session(name):
         return []
 
 
-def save_session(name, messages):
-    """Persist messages atomically (tmp + rename) so an interrupted write can't corrupt the log."""
+def save_session(name, messages, route=None):
+    """Persist messages (and the session's locked route, for sticky routing) atomically (tmp +
+    rename) so an interrupted write can't corrupt the log."""
     os.makedirs(SESSION_DIR, exist_ok=True)
     tmp = _session_path(name) + ".tmp"
+    payload = {"messages": messages}
+    if route is not None:
+        payload["route"] = route
     with open(tmp, "w", encoding="utf-8") as f:
-        json.dump({"messages": messages}, f, ensure_ascii=False, indent=2)
+        json.dump(payload, f, ensure_ascii=False, indent=2)
     os.replace(tmp, _session_path(name))
+
+
+def load_route(name):
+    """The route a session locked onto on its first turn (sticky routing), or None if new/unset.
+    Sticky = classify once, then stay on that model: switching models mid-session only ever costs
+    latency (model reload when they don't co-reside, cold KV cache when they do) and never buys
+    quality, so a session picks its model up front and keeps that one's cache warm."""
+    try:
+        with open(_session_path(name), encoding="utf-8") as f:
+            return json.load(f).get("route")
+    except (OSError, json.JSONDecodeError):
+        return None
 
 
 def trim(messages):
@@ -246,9 +264,16 @@ def main():
         sys.exit(1)
     user_text = f"{context}\n\n{prompt}" if (context and prompt) else (context or prompt)
 
-    # routing: explicit flag > gemma classifier (on the latest turn's text) > coder fallback
+    # routing: explicit flag > session's sticky lock > gemma classifier > coder fallback.
+    # Sticky: a session classifies its FIRST turn, then stays on that model - a coding turn and a
+    # follow-up trivia turn both run on qwen instead of bouncing to gemma. One model's KV cache stays
+    # warm and nothing reloads mid-conversation. An explicit flag still overrides a single turn, and
+    # --reason-hard is the mid-session escalation to gpt-oss.
+    locked = load_route(session) if session else None
     if forced:
         task, how = forced, "flag"
+    elif locked:
+        task, how = locked, "sticky"
     else:
         cls = None if no_llm else classify_with_gemma(prompt or context)
         task, how = (cls, "gemma") if cls else (route_no_classifier(prompt), "fallback")
@@ -307,7 +332,9 @@ def main():
         print(answer)
     if session:
         messages.append({"role": "assistant", "content": answer})
-        save_session(session, messages)
+        # lock the session onto the first turn's route so later turns stay on the same model (sticky);
+        # a one-off explicit flag on a later turn does not move the lock (`locked or task`)
+        save_session(session, messages, route=locked or task)
     if truncated:
         print(f"\n[router] note: answer truncated at num_predict={num_predict} - raise the budget "
               f"(--num-predict N) if it looks cut off.", file=sys.stderr)
