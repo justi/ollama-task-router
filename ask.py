@@ -198,6 +198,7 @@ def _db():
     conn = sqlite3.connect(SESSION_DB)
     try:
         conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute("PRAGMA busy_timeout=5000")  # wait out a concurrent writer instead of failing
         conn.executescript(_SCHEMA)
         try:  # migrate a DB created before the rolling-summary column existed
             conn.execute("ALTER TABLE conversations ADD COLUMN summarized_upto INTEGER NOT NULL DEFAULT 0")
@@ -222,9 +223,11 @@ def resolve_conversation(name=None, cid=None, latest=False):
         if name is not None:
             row = conn.execute("SELECT id FROM conversations WHERE name=?", (name,)).fetchone()
             return row[0] if row else None
-        if latest:
-            row = conn.execute(
-                "SELECT id FROM conversations ORDER BY updated_at DESC, id DESC LIMIT 1").fetchone()
+        if latest:  # "most recent" = the conversation whose last message id is highest (monotonic,
+            row = conn.execute(  # unambiguous - datetime('now') is only second-precision and ties)
+                "SELECT c.id FROM conversations c "
+                "ORDER BY (SELECT MAX(m.id) FROM messages m WHERE m.conversation_id = c.id) DESC, "
+                "c.id DESC LIMIT 1").fetchone()
             return row[0] if row else None
     return None
 
@@ -233,7 +236,11 @@ def create_conversation(name=None):
     """Insert a conversation (named, or unnamed for a fresh --continue thread) and return its id.
     Deferred until the first turn actually succeeds, so a failed run leaves no empty conversation."""
     with _db() as conn:
-        return conn.execute("INSERT INTO conversations(name) VALUES (?)", (name,)).lastrowid
+        try:
+            return conn.execute("INSERT INTO conversations(name) VALUES (?)", (name,)).lastrowid
+        except sqlite3.IntegrityError:  # a concurrent run created this name first - reuse its id
+            row = conn.execute("SELECT id FROM conversations WHERE name=?", (name,)).fetchone()
+            return row[0] if row else None
 
 
 def conversation_route(cid):
@@ -307,9 +314,11 @@ def print_sessions():
 
 def summarize(model, prev_summary, turns):
     """Fold `turns` [(id, role, content)] into `prev_summary` with ONE non-streaming call to the
-    session's own model (already resident - no model switch, no swap-tax). Preserve decisions,
-    definitions, exact identifiers and paths, and open questions; drop pleasantries. On any failure
-    keep the old summary - the verbatim window still carries recent context."""
+    session's sticky model (already resident - no model switch). Preserve decisions, definitions,
+    exact identifiers and file paths, and open questions; drop pleasantries. Returns the updated
+    summary on success, or None on a SOFT FAILURE (exception, empty output, or a truncated
+    done_reason=length response). On None the caller keeps the old summary AND does not advance
+    summarized_upto, so these turns are retried next turn instead of being silently dropped."""
     convo = "\n".join(f"{role}: {content}" for _id, role, content in turns)
     instr = (
         "You keep a running summary of a coding/reasoning conversation so it can continue after older "
@@ -319,16 +328,19 @@ def summarize(model, prev_summary, turns):
         f"CURRENT SUMMARY:\n{prev_summary or '(none yet)'}\n\nNEW TURNS:\n{convo}\n\nUPDATED SUMMARY:")
     try:
         resp = ask(model, instr, False, SUMMARIZE_NUM_PREDICT, temperature=0)
-        return (resp.get("response") or "").strip() or prev_summary
     except Exception:
-        return prev_summary
+        return None
+    text = (resp.get("response") or "").strip()
+    if not text or resp.get("done_reason") == "length":  # empty or truncated -> don't trust the fold
+        return None
+    return text
 
 
-def build_session_payload(conv_id, model, user_text):
+def build_session_payload(conv_id, summarizer_model, user_text):
     """Messages for a session turn: a leading `system` summary of the older turns + the verbatim
     recency window + the new user turn. Turns that just fell out of the window are folded into the
-    rolling summary with one call to the session's own (resident) model, so the thread keeps its
-    older context without re-sending the whole history."""
+    rolling summary with one call to the session's sticky model (`summarizer_model`, already resident),
+    so the thread keeps its older context without re-sending the whole history."""
     rows = _conversation_rows(conv_id)
     summary, upto = conversation_summary(conv_id)
     window = rows[-MAX_MESSAGES:] if len(rows) > MAX_MESSAGES else rows
@@ -337,8 +349,10 @@ def build_session_payload(conv_id, model, user_text):
     if fresh:
         print(f"[router] session: folding {len(fresh)} older turn(s) into the running summary",
               file=sys.stderr)
-        summary = summarize(model, summary, fresh)
-        set_summary(conv_id, summary, fresh[-1][0])
+        new = summarize(summarizer_model, summary, fresh)
+        if new is not None:                       # advance ONLY on a real fold; on a soft failure keep
+            summary = new                         # the old summary + upto so these turns retry next turn
+            set_summary(conv_id, summary, fresh[-1][0])
     msgs = []
     if summary:
         msgs.append({"role": "system", "content": "Earlier in this conversation (summary):\n" + summary})
@@ -456,7 +470,8 @@ def main():
     # a conversation -> /api/chat with a summary of older turns + the recent window + this turn;
     # otherwise a stateless /api/generate
     if want_session:
-        messages = (build_session_payload(conv_id, model, user_text) if conv_id
+        smodel = ROUTES[locked or task][0]   # fold with the session's sticky model, not a one-off route
+        messages = (build_session_payload(conv_id, smodel, user_text) if conv_id
                     else [{"role": "user", "content": user_text}])
         endpoint, payload = "chat", {"model": model, "messages": messages}
     else:

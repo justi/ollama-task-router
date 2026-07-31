@@ -369,17 +369,39 @@ class TestContextSessionBudget(unittest.TestCase):
     def test_session_summarizes_old_turns_and_windows_the_rest(self):
         self._in_temp_sessions()
         cid = ask.create_conversation(name="t")
-        ask.append_turns(cid, [{"role": "user" if i % 2 == 0 else "assistant", "content": str(i)}
-                               for i in range(ask.MAX_MESSAGES + 6)])
+        n = ask.MAX_MESSAGES + 6
+        ask.append_turns(cid, [{"role": "user" if i % 2 == 0 else "assistant", "content": f"m{i}"}
+                               for i in range(n)])
         gen, _ = route(["--session", "t", "--code", "next"])
         msgs = gen["messages"]
         self.assertEqual(msgs[0]["role"], "system", "older turns must fold into a leading summary")
-        self.assertLessEqual(len(msgs[1:-1]), ask.MAX_MESSAGES, "the verbatim window is bounded")
+        window = [m["content"] for m in msgs[1:-1]]
+        self.assertLessEqual(len(window), ask.MAX_MESSAGES, "the verbatim window is bounded")
+        self.assertIn(f"m{n-1}", window, "the window must hold the NEWEST stored turns")
+        self.assertNotIn("m0", window, "the oldest turn is summarized, not in the window")
         self.assertEqual(msgs[-1]["content"], "next")
         self.assertGreater(len(ask.load_session("t")), ask.MAX_MESSAGES, "full history stays in the DB")
         summary, upto = ask.conversation_summary(cid)
         self.assertTrue(summary, "the rolling summary must be persisted")
-        self.assertGreater(upto, 0, "summarized_upto advances past the folded turns")
+        self.assertEqual(upto, n - ask.MAX_MESSAGES, "summarized_upto == id of the last folded message")
+
+    def test_summarizer_failure_keeps_turns_for_retry(self):
+        # A failed/empty/truncated fold must NOT advance summarized_upto - otherwise the turns that
+        # just fell out of the window would be neither summarized nor windowed, i.e. silently lost.
+        self._in_temp_sessions()
+        cid = ask.create_conversation(name="t")
+        ask.append_turns(cid, [{"role": "user" if i % 2 == 0 else "assistant", "content": f"m{i}"}
+                               for i in range(ask.MAX_MESSAGES + 6)])
+        saved_ask, saved_run = ask.ask, ask.run
+        ask.ask = lambda *a, **k: (_ for _ in ()).throw(RuntimeError("summarizer down"))
+        ask.run = lambda *a, **k: ("ok", "stop")
+        try:
+            run_main(["--session", "t", "--code", "next"])
+        finally:
+            ask.ask, ask.run = saved_ask, saved_run
+        summary, upto = ask.conversation_summary(cid)
+        self.assertEqual(upto, 0, "a failed summarizer must not advance summarized_upto (turns retried)")
+        self.assertEqual(summary, "", "a failed summarizer must not persist a bogus summary")
 
     def test_short_session_sends_no_summary(self):
         self._in_temp_sessions()
