@@ -33,7 +33,8 @@ A session classifies its FIRST turn, then STAYS on that model for the rest (stic
 coding turn and a follow-up trivia turn both run on qwen, so one model's KV cache stays warm and
 nothing reloads mid-conversation. An explicit flag (--code/--reason/--quick) overrides a single
 turn; --reason-hard escalates that one turn to gpt-oss. Conversations live in a SQLite DB at
-~/.ask-sessions/sessions.db - the full history is kept; only the recent window is sent each turn.
+~/.ask-sessions/sessions.db - the full history is kept; each turn sends a rolling summary of the
+older turns plus the recent verbatim window (the summary is written by the session's own model).
 
 Build the models first with ./setup.sh. Override the endpoint with OLLAMA_HOST.
 """
@@ -51,17 +52,18 @@ if not HOST.startswith("http"):
 
 SESSION_DIR = os.path.expanduser("~/.ask-sessions")
 SESSION_DB = os.path.join(SESSION_DIR, "sessions.db")  # conversations + messages; stdlib sqlite3, WAL
-MAX_MESSAGES = 20  # payload window: keep the most recent turns so the prompt fits num_ctx. The FULL
-                   # history is durable in the DB; only what we SEND each turn is trimmed.
+MAX_MESSAGES = 20        # verbatim recency window: the last N messages are sent as-is each turn
+SUMMARIZE_NUM_PREDICT = 1200  # budget for the rolling-summary call (folding older turns)
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS conversations (
-  id         INTEGER PRIMARY KEY,
-  name       TEXT UNIQUE,
-  route      TEXT,
-  summary    TEXT NOT NULL DEFAULT '',
-  created_at TEXT NOT NULL DEFAULT (datetime('now')),
-  updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+  id              INTEGER PRIMARY KEY,
+  name            TEXT UNIQUE,
+  route           TEXT,
+  summary         TEXT NOT NULL DEFAULT '',
+  summarized_upto INTEGER NOT NULL DEFAULT 0,  -- max message id already folded into `summary`
+  created_at      TEXT NOT NULL DEFAULT (datetime('now')),
+  updated_at      TEXT NOT NULL DEFAULT (datetime('now'))
 );
 CREATE TABLE IF NOT EXISTS messages (
   id              INTEGER PRIMARY KEY,
@@ -197,6 +199,10 @@ def _db():
     try:
         conn.execute("PRAGMA journal_mode=WAL")
         conn.executescript(_SCHEMA)
+        try:  # migrate a DB created before the rolling-summary column existed
+            conn.execute("ALTER TABLE conversations ADD COLUMN summarized_upto INTEGER NOT NULL DEFAULT 0")
+        except sqlite3.OperationalError:
+            pass  # column already present
         yield conn
         conn.commit()
     finally:
@@ -238,11 +244,32 @@ def conversation_route(cid):
 
 
 def conversation_messages(cid):
-    """Full turn history of a conversation, oldest first (trim() then windows it for the payload)."""
+    """Full turn history of a conversation, oldest first (name-based load_session reader)."""
     with _db() as conn:
         rows = conn.execute(
             "SELECT role, content FROM messages WHERE conversation_id=? ORDER BY id", (cid,)).fetchall()
     return [{"role": r, "content": c} for r, c in rows]
+
+
+def _conversation_rows(cid):
+    """(id, role, content) per turn, oldest first - the id lets us track what the summary covers."""
+    with _db() as conn:
+        return conn.execute(
+            "SELECT id, role, content FROM messages WHERE conversation_id=? ORDER BY id", (cid,)).fetchall()
+
+
+def conversation_summary(cid):
+    """(rolling summary, summarized_upto message id) for a conversation."""
+    with _db() as conn:
+        row = conn.execute(
+            "SELECT summary, summarized_upto FROM conversations WHERE id=?", (cid,)).fetchone()
+    return (row[0], row[1]) if row else ("", 0)
+
+
+def set_summary(cid, summary, upto):
+    with _db() as conn:
+        conn.execute("UPDATE conversations SET summary=?, summarized_upto=? WHERE id=?",
+                     (summary, upto, cid))
 
 
 def append_turns(cid, turns, route=None):
@@ -278,6 +305,48 @@ def print_sessions():
         print(f"  {cid:>3}  {(name or '(unnamed)'):<20}  {(route or '-'):<12}  {count:>4}  {updated}")
 
 
+def summarize(model, prev_summary, turns):
+    """Fold `turns` [(id, role, content)] into `prev_summary` with ONE non-streaming call to the
+    session's own model (already resident - no model switch, no swap-tax). Preserve decisions,
+    definitions, exact identifiers and paths, and open questions; drop pleasantries. On any failure
+    keep the old summary - the verbatim window still carries recent context."""
+    convo = "\n".join(f"{role}: {content}" for _id, role, content in turns)
+    instr = (
+        "You keep a running summary of a coding/reasoning conversation so it can continue after older "
+        "turns scroll out of the window. Merge the new turns into the summary below. Preserve "
+        "decisions, definitions, exact identifiers and file paths, and open questions; drop "
+        "pleasantries. Keep it compact and factual, no preamble.\n\n"
+        f"CURRENT SUMMARY:\n{prev_summary or '(none yet)'}\n\nNEW TURNS:\n{convo}\n\nUPDATED SUMMARY:")
+    try:
+        resp = ask(model, instr, False, SUMMARIZE_NUM_PREDICT, temperature=0)
+        return (resp.get("response") or "").strip() or prev_summary
+    except Exception:
+        return prev_summary
+
+
+def build_session_payload(conv_id, model, user_text):
+    """Messages for a session turn: a leading `system` summary of the older turns + the verbatim
+    recency window + the new user turn. Turns that just fell out of the window are folded into the
+    rolling summary with one call to the session's own (resident) model, so the thread keeps its
+    older context without re-sending the whole history."""
+    rows = _conversation_rows(conv_id)
+    summary, upto = conversation_summary(conv_id)
+    window = rows[-MAX_MESSAGES:] if len(rows) > MAX_MESSAGES else rows
+    older = rows[:-MAX_MESSAGES] if len(rows) > MAX_MESSAGES else []
+    fresh = [r for r in older if r[0] > upto]     # older turns not yet folded into the summary
+    if fresh:
+        print(f"[router] session: folding {len(fresh)} older turn(s) into the running summary",
+              file=sys.stderr)
+        summary = summarize(model, summary, fresh)
+        set_summary(conv_id, summary, fresh[-1][0])
+    msgs = []
+    if summary:
+        msgs.append({"role": "system", "content": "Earlier in this conversation (summary):\n" + summary})
+    msgs += [{"role": role, "content": content} for _id, role, content in window]
+    msgs.append({"role": "user", "content": user_text})
+    return msgs
+
+
 def load_session(name):
     """Full history of the named conversation (or []). Name-based convenience over the id API."""
     cid = resolve_conversation(name=name)
@@ -288,17 +357,6 @@ def load_route(name):
     """Sticky route of the named conversation, or None if new/unset."""
     cid = resolve_conversation(name=name)
     return conversation_route(cid) if cid else None
-
-
-def trim(messages):
-    """Window the PAYLOAD to the most recent MAX_MESSAGES so the prompt fits num_ctx. The full history
-    stays in the DB; this only bounds what we send. (A rolling summary of the older turns is the
-    planned next step - for now the oldest are simply not sent.)"""
-    if len(messages) <= MAX_MESSAGES:
-        return messages
-    print(f"[router] session: sending the last {MAX_MESSAGES} of {len(messages)} turns "
-          f"(older ones stay in the DB, just not sent)", file=sys.stderr)
-    return messages[-MAX_MESSAGES:]
 
 
 def read_context(file_path):
@@ -395,10 +453,11 @@ def main():
     print(f"[router] task={task} (via {how}) -> {model}{note}"
           f"{' (thinking, this may take a moment)' if think else ''}\n", file=sys.stderr)
 
-    # a conversation -> stateful /api/chat over the trimmed history; otherwise a stateless /api/generate
+    # a conversation -> /api/chat with a summary of older turns + the recent window + this turn;
+    # otherwise a stateless /api/generate
     if want_session:
-        prior = conversation_messages(conv_id) if conv_id else []
-        messages = trim(prior + [{"role": "user", "content": user_text}])
+        messages = (build_session_payload(conv_id, model, user_text) if conv_id
+                    else [{"role": "user", "content": user_text}])
         endpoint, payload = "chat", {"model": model, "messages": messages}
     else:
         messages, endpoint, payload = None, "generate", {"model": model, "prompt": user_text}

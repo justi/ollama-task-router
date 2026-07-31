@@ -366,16 +366,28 @@ class TestContextSessionBudget(unittest.TestCase):
         g3, _ = route(["--session", "t", "keep going"], response=enum_response("quick"))
         self.assertEqual(g3["model"], "qwen-fast", "one-off flag must not move the sticky lock")
 
-    def test_session_windows_the_payload_but_keeps_full_history(self):
+    def test_session_summarizes_old_turns_and_windows_the_rest(self):
         self._in_temp_sessions()
         cid = ask.create_conversation(name="t")
         ask.append_turns(cid, [{"role": "user" if i % 2 == 0 else "assistant", "content": str(i)}
                                for i in range(ask.MAX_MESSAGES + 6)])
         gen, _ = route(["--session", "t", "--code", "next"])
-        self.assertLessEqual(len(gen["messages"]), ask.MAX_MESSAGES, "payload windowed to fit num_ctx")
-        self.assertEqual(gen["messages"][-1]["content"], "next")
-        self.assertGreater(len(ask.load_session("t")), ask.MAX_MESSAGES,
-                           "the full history stays in the DB even though the sent payload is windowed")
+        msgs = gen["messages"]
+        self.assertEqual(msgs[0]["role"], "system", "older turns must fold into a leading summary")
+        self.assertLessEqual(len(msgs[1:-1]), ask.MAX_MESSAGES, "the verbatim window is bounded")
+        self.assertEqual(msgs[-1]["content"], "next")
+        self.assertGreater(len(ask.load_session("t")), ask.MAX_MESSAGES, "full history stays in the DB")
+        summary, upto = ask.conversation_summary(cid)
+        self.assertTrue(summary, "the rolling summary must be persisted")
+        self.assertGreater(upto, 0, "summarized_upto advances past the folded turns")
+
+    def test_short_session_sends_no_summary(self):
+        self._in_temp_sessions()
+        route(["--session", "t", "--code", "one"])
+        gen, calls = route(["--session", "t", "--code", "two"])
+        self.assertNotEqual(gen["messages"][0]["role"], "system",
+                            "no summary until the window overflows")
+        self.assertEqual(len(calls), 1, "a short session makes no summarizer call - only the generation")
 
     def test_continue_resumes_the_latest_conversation(self):
         self._in_temp_sessions()
