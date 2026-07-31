@@ -25,18 +25,22 @@ Real work is multi-turn and needs context, so also:
   ./ask.py --file bug.py --code "fix it"                              # or name the file
   ./ask.py --session fix "write is_prime"                             # remember this conversation
   ./ask.py --session fix "now handle n<2"                             # next turn sees the history
-  ./ask.py --continue "and add a docstring"                          # --continue = --session default
-  ./ask.py --stream --reason "..."                                    # print tokens as they arrive
+  ./ask.py --continue "and add a docstring"                          # resume the most recent thread
+  ./ask.py --sessions                                                # list saved conversations
+  ./ask.py --cid 3 "back to that one"                                # resume a specific thread by id
 
 A session classifies its FIRST turn, then STAYS on that model for the rest (sticky routing): a
 coding turn and a follow-up trivia turn both run on qwen, so one model's KV cache stays warm and
 nothing reloads mid-conversation. An explicit flag (--code/--reason/--quick) overrides a single
-turn; --reason-hard escalates that one turn to gpt-oss. Sessions live in ~/.ask-sessions/<name>.json.
+turn; --reason-hard escalates that one turn to gpt-oss. Conversations live in a SQLite DB at
+~/.ask-sessions/sessions.db - the full history is kept; only the recent window is sent each turn.
 
 Build the models first with ./setup.sh. Override the endpoint with OLLAMA_HOST.
 """
+import contextlib
 import json
 import os
+import sqlite3
 import sys
 import urllib.error
 import urllib.request
@@ -46,7 +50,27 @@ if not HOST.startswith("http"):
     HOST = "http://" + HOST
 
 SESSION_DIR = os.path.expanduser("~/.ask-sessions")
-MAX_MESSAGES = 20  # keep the most recent turns; older context is dropped so history fits num_ctx
+SESSION_DB = os.path.join(SESSION_DIR, "sessions.db")  # conversations + messages; stdlib sqlite3, WAL
+MAX_MESSAGES = 20  # payload window: keep the most recent turns so the prompt fits num_ctx. The FULL
+                   # history is durable in the DB; only what we SEND each turn is trimmed.
+
+_SCHEMA = """
+CREATE TABLE IF NOT EXISTS conversations (
+  id         INTEGER PRIMARY KEY,
+  name       TEXT UNIQUE,
+  route      TEXT,
+  summary    TEXT NOT NULL DEFAULT '',
+  created_at TEXT NOT NULL DEFAULT (datetime('now')),
+  updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+CREATE TABLE IF NOT EXISTS messages (
+  id              INTEGER PRIMARY KEY,
+  conversation_id INTEGER NOT NULL REFERENCES conversations(id),
+  role            TEXT NOT NULL,
+  content         TEXT NOT NULL,
+  created_at      TEXT NOT NULL DEFAULT (datetime('now'))
+);
+"""
 
 # task -> (model, think, num_predict). qwen-fast is qwen3.6 (dual-mode): code forces think=False
 # (thinking hurts code), reason turns think ON - qwen3.6-think-on reasons as well as gpt-oss AND is
@@ -163,52 +187,117 @@ def run(endpoint, payload, stream=False, timeout=900, on_chunk=None):
         return answer, done
 
 
-def _session_path(name):
-    safe = "".join(c for c in name if c.isalnum() or c in "-_")[:64] or "default"
-    return os.path.join(SESSION_DIR, safe + ".json")
+@contextlib.contextmanager
+def _db():
+    """A SQLite connection with the schema ensured (WAL so concurrent CLI runs don't race). Commits
+    on a clean exit, always closes. One conversation = a thread of turns; the sticky route and the
+    (planned) rolling summary live on the conversation row."""
+    os.makedirs(SESSION_DIR, exist_ok=True)
+    conn = sqlite3.connect(SESSION_DB)
+    try:
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.executescript(_SCHEMA)
+        yield conn
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def resolve_conversation(name=None, cid=None, latest=False):
+    """Find a conversation id WITHOUT creating it: by id (--cid; exits if missing), by name
+    (--session; None if new), or the most recently updated one (--continue; None if none exist)."""
+    with _db() as conn:
+        if cid is not None:
+            row = conn.execute("SELECT id FROM conversations WHERE id=?", (cid,)).fetchone()
+            if not row:
+                print(f"[!] No conversation with id {cid} (list them with --sessions).", file=sys.stderr)
+                sys.exit(1)
+            return row[0]
+        if name is not None:
+            row = conn.execute("SELECT id FROM conversations WHERE name=?", (name,)).fetchone()
+            return row[0] if row else None
+        if latest:
+            row = conn.execute(
+                "SELECT id FROM conversations ORDER BY updated_at DESC, id DESC LIMIT 1").fetchone()
+            return row[0] if row else None
+    return None
+
+
+def create_conversation(name=None):
+    """Insert a conversation (named, or unnamed for a fresh --continue thread) and return its id.
+    Deferred until the first turn actually succeeds, so a failed run leaves no empty conversation."""
+    with _db() as conn:
+        return conn.execute("INSERT INTO conversations(name) VALUES (?)", (name,)).lastrowid
+
+
+def conversation_route(cid):
+    """The sticky route locked on the conversation's first turn, or None."""
+    with _db() as conn:
+        row = conn.execute("SELECT route FROM conversations WHERE id=?", (cid,)).fetchone()
+    return row[0] if row else None
+
+
+def conversation_messages(cid):
+    """Full turn history of a conversation, oldest first (trim() then windows it for the payload)."""
+    with _db() as conn:
+        rows = conn.execute(
+            "SELECT role, content FROM messages WHERE conversation_id=? ORDER BY id", (cid,)).fetchall()
+    return [{"role": r, "content": c} for r, c in rows]
+
+
+def append_turns(cid, turns, route=None):
+    """Append (role, content) turns and bump updated_at. `route` locks the sticky model on the FIRST
+    turn only - COALESCE keeps an already-set route, so a one-off flag on a later turn can't move it."""
+    with _db() as conn:
+        conn.executemany(
+            "INSERT INTO messages(conversation_id, role, content) VALUES (?,?,?)",
+            [(cid, t["role"], t["content"]) for t in turns])
+        if route is not None:
+            conn.execute("UPDATE conversations SET route=COALESCE(route, ?), updated_at=datetime('now') "
+                         "WHERE id=?", (route, cid))
+        else:
+            conn.execute("UPDATE conversations SET updated_at=datetime('now') WHERE id=?", (cid,))
+
+
+def list_conversations():
+    """(id, name, route, turn_count, updated_at) for every conversation, most-recent first."""
+    with _db() as conn:
+        return conn.execute(
+            "SELECT c.id, c.name, c.route, COUNT(m.id), c.updated_at "
+            "FROM conversations c LEFT JOIN messages m ON m.conversation_id = c.id "
+            "GROUP BY c.id ORDER BY c.updated_at DESC, c.id DESC").fetchall()
+
+
+def print_sessions():
+    rows = list_conversations()
+    if not rows:
+        print("No conversations yet.")
+        return
+    print("   id  name                  route         turns  updated")
+    for cid, name, route, count, updated in rows:
+        print(f"  {cid:>3}  {(name or '(unnamed)'):<20}  {(route or '-'):<12}  {count:>4}  {updated}")
 
 
 def load_session(name):
-    """Prior messages for a session, or [] if new/unreadable."""
-    try:
-        with open(_session_path(name), encoding="utf-8") as f:
-            return json.load(f).get("messages", [])
-    except (OSError, json.JSONDecodeError):
-        return []
-
-
-def save_session(name, messages, route=None):
-    """Persist messages (and the session's locked route, for sticky routing) atomically (tmp +
-    rename) so an interrupted write can't corrupt the log."""
-    os.makedirs(SESSION_DIR, exist_ok=True)
-    tmp = _session_path(name) + ".tmp"
-    payload = {"messages": messages}
-    if route is not None:
-        payload["route"] = route
-    with open(tmp, "w", encoding="utf-8") as f:
-        json.dump(payload, f, ensure_ascii=False, indent=2)
-    os.replace(tmp, _session_path(name))
+    """Full history of the named conversation (or []). Name-based convenience over the id API."""
+    cid = resolve_conversation(name=name)
+    return conversation_messages(cid) if cid else []
 
 
 def load_route(name):
-    """The route a session locked onto on its first turn (sticky routing), or None if new/unset.
-    Sticky = classify once, then stay on that model: switching models mid-session only ever costs
-    latency (model reload when they don't co-reside, cold KV cache when they do) and never buys
-    quality, so a session picks its model up front and keeps that one's cache warm."""
-    try:
-        with open(_session_path(name), encoding="utf-8") as f:
-            return json.load(f).get("route")
-    except (OSError, json.JSONDecodeError):
-        return None
+    """Sticky route of the named conversation, or None if new/unset."""
+    cid = resolve_conversation(name=name)
+    return conversation_route(cid) if cid else None
 
 
 def trim(messages):
-    """Keep the most recent MAX_MESSAGES so a long session still fits num_ctx; drop the oldest.
-    Simple by design - a smarter summary-of-old-turns is a deliberate later step, not guessed now."""
+    """Window the PAYLOAD to the most recent MAX_MESSAGES so the prompt fits num_ctx. The full history
+    stays in the DB; this only bounds what we send. (A rolling summary of the older turns is the
+    planned next step - for now the oldest are simply not sent.)"""
     if len(messages) <= MAX_MESSAGES:
         return messages
-    print(f"[router] session: dropped {len(messages) - MAX_MESSAGES} old message(s) to fit context",
-          file=sys.stderr)
+    print(f"[router] session: sending the last {MAX_MESSAGES} of {len(messages)} turns "
+          f"(older ones stay in the DB, just not sent)", file=sys.stderr)
     return messages[-MAX_MESSAGES:]
 
 
@@ -243,10 +332,14 @@ def _pop_value(args, flag):
 
 def main():
     args = sys.argv[1:]
+    if "--sessions" in args:            # a query command: list conversations and exit
+        print_sessions()
+        return
+    cid_arg = _pop_value(args, "--cid")
     session = _pop_value(args, "--session")
-    if "--continue" in args:
+    continue_flag = "--continue" in args
+    if continue_flag:
         args = [a for a in args if a != "--continue"]
-        session = session or "default"
     file_path = _pop_value(args, "--file")
     np_override = _pop_value(args, "--num-predict")  # one-shot budget override (also in the retry hint)
     stream = "--stream" in args
@@ -256,6 +349,20 @@ def main():
     task_flags = ("--code", "--reason", "--reason-hard", "--quick")
     forced = next((a[2:] for a in args if a in task_flags), None)
     args = [a for a in args if a not in task_flags]
+
+    # which conversation (if any) this turn belongs to: --cid <id> > --session <name> > --continue.
+    # Resolve WITHOUT creating - a new thread's row is only inserted once the first turn succeeds.
+    conv_id, want_session, sess_label = None, False, None
+    if cid_arg is not None:
+        if not cid_arg.isdigit():
+            print("[!] --cid must be a conversation id (integer); see --sessions.", file=sys.stderr)
+            sys.exit(1)
+        conv_id, want_session, sess_label = resolve_conversation(cid=int(cid_arg)), True, f"#{cid_arg}"
+    elif session is not None:
+        conv_id, want_session, sess_label = resolve_conversation(name=session), True, session
+    elif continue_flag:
+        conv_id = resolve_conversation(latest=True)
+        want_session, sess_label = True, (f"#{conv_id}" if conv_id else "new")
 
     context = read_context(file_path)
     prompt = " ".join(args).strip()
@@ -269,7 +376,7 @@ def main():
     # follow-up trivia turn both run on qwen instead of bouncing to gemma. One model's KV cache stays
     # warm and nothing reloads mid-conversation. An explicit flag still overrides a single turn, and
     # --reason-hard is the mid-session escalation to gpt-oss.
-    locked = load_route(session) if session else None
+    locked = conversation_route(conv_id) if conv_id else None
     if forced:
         task, how = forced, "flag"
     elif locked:
@@ -284,13 +391,14 @@ def main():
         else:
             print(f"[!] --num-predict must be a positive integer (got {np_override!r})", file=sys.stderr)
             sys.exit(1)
-    note = f" [session {session}]" if session else ""
+    note = f" [session {sess_label}]" if want_session else ""
     print(f"[router] task={task} (via {how}) -> {model}{note}"
           f"{' (thinking, this may take a moment)' if think else ''}\n", file=sys.stderr)
 
-    # session -> stateful /api/chat over shared history; otherwise a stateless /api/generate
-    if session:
-        messages = trim(load_session(session) + [{"role": "user", "content": user_text}])
+    # a conversation -> stateful /api/chat over the trimmed history; otherwise a stateless /api/generate
+    if want_session:
+        prior = conversation_messages(conv_id) if conv_id else []
+        messages = trim(prior + [{"role": "user", "content": user_text}])
         endpoint, payload = "chat", {"model": model, "messages": messages}
     else:
         messages, endpoint, payload = None, "generate", {"model": model, "prompt": user_text}
@@ -330,11 +438,13 @@ def main():
         print()  # newline after the streamed chunks
     else:
         print(answer)
-    if session:
-        messages.append({"role": "assistant", "content": answer})
-        # lock the session onto the first turn's route so later turns stay on the same model (sticky);
-        # a one-off explicit flag on a later turn does not move the lock (`locked or task`)
-        save_session(session, messages, route=locked or task)
+    if want_session:
+        if conv_id is None:                       # first successful turn of a new thread -> create it now
+            conv_id = create_conversation(name=session)
+        # store the full turns (not the trimmed payload); route locks the sticky model on the first
+        # turn only (append_turns COALESCEs, so a one-off flag on a later turn can't move the lock).
+        append_turns(conv_id, [{"role": "user", "content": user_text},
+                               {"role": "assistant", "content": answer}], route=task)
     if truncated:
         print(f"\n[router] note: answer truncated at num_predict={num_predict} - raise the budget "
               f"(--num-predict N) if it looks cut off.", file=sys.stderr)

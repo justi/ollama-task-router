@@ -304,19 +304,21 @@ class TestContextSessionBudget(unittest.TestCase):
 
     def _in_temp_sessions(self):
         d = tempfile.mkdtemp()
-        self._saved_session_dir = ask.SESSION_DIR
+        self._saved_dir, self._saved_db = ask.SESSION_DIR, ask.SESSION_DB
         ask.SESSION_DIR = d
-        self.addCleanup(lambda: setattr(ask, "SESSION_DIR", self._saved_session_dir))
+        ask.SESSION_DB = os.path.join(d, "sessions.db")
+        self.addCleanup(lambda: setattr(ask, "SESSION_DIR", self._saved_dir))
+        self.addCleanup(lambda: setattr(ask, "SESSION_DB", self._saved_db))
         self.addCleanup(lambda: shutil.rmtree(d, ignore_errors=True))
         return d
 
     def test_session_uses_chat_and_persists_the_turn(self):
-        d = self._in_temp_sessions()
+        self._in_temp_sessions()
         gen, _ = route(["--session", "t", "--code", "write is_prime"])
         self.assertEqual(gen["endpoint"], "chat", "a session must use /api/chat, not /api/generate")
         self.assertEqual(gen["model"], "qwen-fast")
         self.assertEqual(gen["messages"][-1], {"role": "user", "content": "write is_prime"})
-        stored = json.load(open(os.path.join(d, "t.json"), encoding="utf-8"))["messages"]
+        stored = ask.load_session("t")
         self.assertEqual(stored[0]["role"], "user")
         self.assertEqual(stored[-1]["role"], "assistant", "the answer must be persisted")
 
@@ -350,10 +352,9 @@ class TestContextSessionBudget(unittest.TestCase):
         self.assertEqual(len(calls2), 1, "sticky turn must skip classification (generation call only)")
 
     def test_session_locks_route_on_first_turn(self):
-        d = self._in_temp_sessions()
+        self._in_temp_sessions()
         route(["--session", "t", "solve this step by step"], response=enum_response("reason"))
-        stored = json.load(open(os.path.join(d, "t.json"), encoding="utf-8"))
-        self.assertEqual(stored.get("route"), "reason", "first turn must lock the session's route")
+        self.assertEqual(ask.load_route("t"), "reason", "first turn must lock the session's route")
 
     def test_oneoff_flag_does_not_move_the_sticky_lock(self):
         # An explicit flag routes THAT turn but must not re-lock the session: after a one-off
@@ -365,14 +366,37 @@ class TestContextSessionBudget(unittest.TestCase):
         g3, _ = route(["--session", "t", "keep going"], response=enum_response("quick"))
         self.assertEqual(g3["model"], "qwen-fast", "one-off flag must not move the sticky lock")
 
-    def test_session_trims_to_the_recent_window(self):
+    def test_session_windows_the_payload_but_keeps_full_history(self):
         self._in_temp_sessions()
-        long_history = [{"role": "user" if i % 2 == 0 else "assistant", "content": str(i)}
-                        for i in range(ask.MAX_MESSAGES + 6)]
-        ask.save_session("t", long_history)
+        cid = ask.create_conversation(name="t")
+        ask.append_turns(cid, [{"role": "user" if i % 2 == 0 else "assistant", "content": str(i)}
+                               for i in range(ask.MAX_MESSAGES + 6)])
         gen, _ = route(["--session", "t", "--code", "next"])
-        self.assertLessEqual(len(gen["messages"]), ask.MAX_MESSAGES, "old turns dropped to fit num_ctx")
+        self.assertLessEqual(len(gen["messages"]), ask.MAX_MESSAGES, "payload windowed to fit num_ctx")
         self.assertEqual(gen["messages"][-1]["content"], "next")
+        self.assertGreater(len(ask.load_session("t")), ask.MAX_MESSAGES,
+                           "the full history stays in the DB even though the sent payload is windowed")
+
+    def test_continue_resumes_the_latest_conversation(self):
+        self._in_temp_sessions()
+        route(["--session", "a", "--code", "first"])
+        route(["--session", "b", "--code", "second"])          # b is now the most recent
+        gen, _ = route(["--continue", "--code", "more"])
+        contents = [m["content"] for m in gen["messages"]]
+        self.assertIn("second", contents, "--continue must resume the latest thread (b)")
+        self.assertNotIn("first", contents, "not the older thread (a)")
+        self.assertEqual(gen["messages"][-1]["content"], "more")
+
+    def test_cid_resumes_a_specific_conversation(self):
+        self._in_temp_sessions()
+        route(["--session", "a", "--code", "alpha"])
+        cid = ask.resolve_conversation(name="a")
+        route(["--session", "b", "--code", "beta"])            # a different thread is now latest
+        gen, _ = route(["--cid", str(cid), "--code", "back to a"])
+        self.assertEqual(gen["endpoint"], "chat")
+        contents = [m["content"] for m in gen["messages"]]
+        self.assertIn("alpha", contents, "--cid must target that exact conversation")
+        self.assertNotIn("beta", contents)
 
 
 @unittest.skipUnless(LIVE, LIVE_REASON)
